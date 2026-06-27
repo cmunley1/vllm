@@ -46,6 +46,33 @@ class NemotronV3Parser(Qwen3Parser):
     reasoning and content.
     """
 
+    def adjust_request(
+        self,
+        request: ChatCompletionRequest | ResponsesRequest,
+    ) -> ChatCompletionRequest | ResponsesRequest:
+        # Translate OpenAI-standard reasoning_effort into Nemotron chat
+        # template native kwargs. Each Nemotron variant reads different kwargs:
+        #   Nano:  enable_thinking only (no low/medium_effort knob)
+        #   Super: enable_thinking + low_effort
+        #   Ultra: enable_thinking + medium_effort
+        # Unsupported effort levels for a given variant are no-ops at the
+        # template level, which is acceptable.
+        reasoning_effort = getattr(request, "reasoning_effort", None)
+        if reasoning_effort is not None:
+            chat_kwargs = getattr(request, "chat_template_kwargs", None)
+            if chat_kwargs is None and hasattr(request, "chat_template_kwargs"):
+                chat_kwargs = {}
+                request.chat_template_kwargs = chat_kwargs
+            if chat_kwargs is not None:
+                if reasoning_effort == "none" and "enable_thinking" not in chat_kwargs:
+                    chat_kwargs["enable_thinking"] = False
+                elif reasoning_effort == "low" and "low_effort" not in chat_kwargs:
+                    chat_kwargs["low_effort"] = True
+                elif reasoning_effort == "medium" and "medium_effort" not in chat_kwargs:
+                    chat_kwargs["medium_effort"] = True
+                # "high"/None -> default full-thinking, no kwarg needed
+        return request
+
     def __init__(
         self,
         tokenizer: TokenizerLike,
