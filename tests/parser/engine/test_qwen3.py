@@ -856,6 +856,74 @@ class TestAnyOfTypeCoercion:
         assert args["port"] == "8080"
 
 
+class TestRootCompositionTypeCoercion:
+    @pytest.fixture
+    def parser_with_composition(self, mock_tokenizer):
+        from vllm.entrypoints.openai.chat_completion.protocol import (
+            ChatCompletionToolsParam,
+        )
+
+        tools = [
+            ChatCompletionToolsParam(
+                type="function",
+                function={
+                    "name": "acme",
+                    "parameters": {
+                        "type": "object",
+                        "oneOf": [
+                            {
+                                "type": "object",
+                                "properties": {
+                                    "kind": {"const": "acme"},
+                                    "payload": {
+                                        "type": "object",
+                                        "properties": {"value": {"type": "string"}},
+                                        "required": ["value"],
+                                    },
+                                },
+                                "required": ["kind", "payload"],
+                            },
+                            {
+                                "type": "object",
+                                "properties": {"kind": {"const": "other"}},
+                                "required": ["kind"],
+                            },
+                        ],
+                    },
+                },
+            )
+        ]
+        return ParserEngine(
+            mock_tokenizer,
+            tools=tools,
+            parser_engine_config=qwen3_config(thinking=False),
+        )
+
+    def test_object_param(self, parser_with_composition, mock_request):
+        text = (
+            "<tool_call>\n<function=acme>\n"
+            "<parameter=kind>acme</parameter>\n"
+            '<parameter=payload>{"value":"hello"}</parameter>\n'
+            "</function>\n</tool_call>"
+        )
+        result = parser_with_composition.extract_tool_calls(text, mock_request)
+        args = json.loads(result.tool_calls[0].function.arguments)
+        assert args == {"kind": "acme", "payload": {"value": "hello"}}
+
+    def test_streaming_object_param(self, parser_with_composition, mock_request):
+        chunks = [
+            "<tool_call>\n",
+            "<function=acme>\n",
+            "<parameter=kind>acme</parameter>\n",
+            '<parameter=payload>{"value":"hello"}</parameter>\n',
+            "</function>\n",
+            "</tool_call>",
+        ]
+        results = simulate_tool_streaming(parser_with_composition, mock_request, chunks)
+        args = json.loads(collect_tool_arguments(results))
+        assert args == {"kind": "acme", "payload": {"value": "hello"}}
+
+
 class TestSchemaCoercionBoolNumberNull:
     """Verify that _fix_arg_types coerces string values to non-string
     schema types using coerce_to_schema_type."""

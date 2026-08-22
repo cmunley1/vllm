@@ -273,20 +273,49 @@ def find_tool_properties(
     tools: list[Tool] | None,
     tool_name: str,
 ) -> dict[str, Any]:
-    """Find a tool by name and return its properties dict, or {}."""
+    """Return direct properties from a tool schema and its root compositions."""
     if not tools:
         return {}
     for tool in tools:
         if isinstance(tool, (FunctionTool, NamespaceTool)):
-            for name, params in iter_response_function_tool_info(tool):
-                if name == tool_name:
-                    return (params or {}).get("properties", {})
+            tool_info = iter_response_function_tool_info(tool)
+        elif _is_function_tool(tool):
+            tool_info = [_extract_tool_info(tool)]
+        else:
             continue
-        if not _is_function_tool(tool):
-            continue
-        name, params = _extract_tool_info(tool)
-        if name == tool_name:
-            return (params or {}).get("properties", {})
+        for name, params in tool_info:
+            if name != tool_name:
+                continue
+            parameter_schema = params or {}
+            composition_fields = ("anyOf", "oneOf", "allOf")
+            if not any(field in parameter_schema for field in composition_fields):
+                return parameter_schema.get("properties", {})
+            root_properties = parameter_schema.get("properties")
+            if not isinstance(root_properties, dict):
+                root_properties = {}
+            properties = dict(root_properties)
+            conflicting_keys: set[str] = set()
+            for field in composition_fields:
+                options = parameter_schema.get(field)
+                if not isinstance(options, list):
+                    continue
+                for option in options:
+                    if not isinstance(option, dict):
+                        continue
+                    option_properties = option.get("properties")
+                    if not isinstance(option_properties, dict):
+                        continue
+                    for key, value in option_properties.items():
+                        if key in root_properties or key in conflicting_keys:
+                            continue
+                        if key not in properties:
+                            properties[key] = value
+                            continue
+                        if properties[key] == value:
+                            continue
+                        properties.pop(key)
+                        conflicting_keys.add(key)
+            return properties
     return {}
 
 
