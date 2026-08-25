@@ -12,7 +12,11 @@ from vllm.entrypoints.openai.chat_completion.protocol import (
     ChatCompletionToolsParam,
 )
 from vllm.tool_parsers.streaming import extract_required_tool_call_streaming
-from vllm.tool_parsers.utils import find_tool_properties, get_json_schema_from_tools
+from vllm.tool_parsers.utils import (
+    find_tool_properties,
+    find_tool_schema,
+    get_json_schema_from_tools,
+)
 
 pytestmark = pytest.mark.cpu_test
 
@@ -393,62 +397,19 @@ class TestNonFunctionToolsSkipped:
         assert any_of[0]["properties"]["name"]["enum"] == ["get_weather"]
 
 
-@pytest.mark.parametrize("keyword", ("oneOf", "anyOf", "allOf"))
-def test_find_tool_properties_root_composition(keyword):
-    tool = FunctionTool(
-        type="function",
-        name="acme",
-        parameters={keyword: [{"properties": {"payload": {"type": "object"}}}]},
-    )
-    assert find_tool_properties([tool], "acme") == {"payload": {"type": "object"}}
-
-
-def test_find_tool_properties_preserves_root_property_schema():
-    payload = {
+@pytest.mark.parametrize("tool_type", ("chat", "responses"))
+def test_find_tool_schema_returns_composed_schema(tool_type):
+    schema = {
         "type": "object",
-        "properties": {"count": {"type": "integer"}},
+        "oneOf": [{"properties": {"payload": {"type": "object"}}}],
     }
-    tool = FunctionTool(
-        type="function",
-        name="acme",
-        parameters={
-            "properties": {"payload": payload},
-            "oneOf": [
-                {"properties": {"payload": {"type": "object", "description": "acme"}}}
-            ],
-        },
-    )
-    assert find_tool_properties([tool], "acme") == {"payload": payload}
+    if tool_type == "chat":
+        tool = ChatCompletionToolsParam(
+            type="function",
+            function={"name": "acme", "parameters": schema},
+        )
+    else:
+        tool = FunctionTool(type="function", name="acme", parameters=schema)
 
-
-def test_find_tool_properties_merges_allof_branches():
-    tool = FunctionTool(
-        type="function",
-        name="acme",
-        parameters={
-            "allOf": [
-                {"properties": {"payload": {"type": "object"}}},
-                {"properties": {"count": {"type": "integer"}}},
-            ]
-        },
-    )
-    assert find_tool_properties([tool], "acme") == {
-        "payload": {"type": "object"},
-        "count": {"type": "integer"},
-    }
-
-
-def test_find_tool_properties_drops_conflicting_branch_types():
-    schemas = ({"type": "string"}, {"type": "object"}, {"type": "string"})
-    branches = [{"properties": {"payload": schema}} for schema in schemas]
-    tool = FunctionTool(type="function", name="acme", parameters={"oneOf": branches})
-    assert find_tool_properties([tool], "acme") == {}
-
-
-@pytest.mark.parametrize(
-    "parameters",
-    ({"anyOf": 5}, {"anyOf": None}, {"oneOf": [{"properties": ["payload"]}]}),
-)
-def test_find_tool_properties_ignores_malformed_compositions(parameters):
-    tool = FunctionTool(type="function", name="acme", parameters=parameters)
+    assert find_tool_schema([tool], "acme") == schema
     assert find_tool_properties([tool], "acme") == {}

@@ -54,6 +54,33 @@ def make_tools(*names: str):
     ]
 
 
+@pytest.fixture
+def composed_tools():
+    return [
+        ChatCompletionToolsParam(
+            function=FunctionDefinition(
+                name="acme",
+                parameters={
+                    "type": "object",
+                    "oneOf": [
+                        {
+                            "properties": {
+                                "kind": {"const": "acme"},
+                                "payload": {"type": "object"},
+                            },
+                            "required": ["kind", "payload"],
+                        },
+                        {
+                            "properties": {"kind": {"const": "other"}},
+                            "required": ["kind"],
+                        },
+                    ],
+                },
+            ),
+        )
+    ]
+
+
 class TestNonStreaming:
     def test_no_tool_calls(self, parser, mock_request):
         result = parser.extract_tool_calls(
@@ -124,6 +151,20 @@ class TestNonStreaming:
             "include_hourly": True,
         }
 
+    def test_root_composition(self, mock_tokenizer, mock_request, composed_tools):
+        parser = MinimaxM2Parser(mock_tokenizer, tools=composed_tools)
+        result = parser.extract_tool_calls(
+            '<minimax:tool_call><invoke name="acme">'
+            '<parameter name="kind">acme</parameter>'
+            '<parameter name="payload">{"value":"hello"}</parameter>'
+            "</invoke></minimax:tool_call>",
+            mock_request,
+        )
+        assert json.loads(result.tool_calls[0].function.arguments) == {
+            "kind": "acme",
+            "payload": {"value": "hello"},
+        }
+
     def test_invalid_tool_name_is_rejected(self, mock_tokenizer, mock_request):
         tools = make_tools("search")
         parser = MinimaxM2Parser(mock_tokenizer)
@@ -175,6 +216,26 @@ class TestStreaming:
         assert collect_function_name(results) == "get_weather"
         assert json.loads(collect_tool_arguments(results)) == {
             "city": "Seattle",
+        }
+
+    def test_streaming_root_composition(
+        self, mock_tokenizer, mock_request, composed_tools
+    ):
+        parser = MinimaxM2Parser(mock_tokenizer, tools=composed_tools)
+        results = simulate_tool_streaming(
+            parser,
+            mock_request,
+            [
+                "<minimax:tool_call>",
+                '<invoke name="acme">',
+                '<parameter name="payload">{"value":"hello"}</parameter>',
+                '<parameter name="kind">acme</parameter>',
+                "</invoke></minimax:tool_call>",
+            ],
+        )
+        assert json.loads(collect_tool_arguments(results)) == {
+            "payload": {"value": "hello"},
+            "kind": "acme",
         }
 
     def test_streaming_multiple_invokes(self, parser, mock_request):

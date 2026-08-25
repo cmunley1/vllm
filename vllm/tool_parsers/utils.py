@@ -269,13 +269,13 @@ def _extract_tool_info(
         raise TypeError(f"Unsupported tool type: {type(tool)}")
 
 
-def find_tool_properties(
+def find_tool_schema(
     tools: list[Tool] | None,
     tool_name: str,
-) -> dict[str, Any]:
-    """Return direct properties from a tool schema and its root compositions."""
+) -> dict[str, Any] | None:
+    """Return a function tool's parameter schema."""
     if not tools:
-        return {}
+        return None
     for tool in tools:
         if isinstance(tool, (FunctionTool, NamespaceTool)):
             tool_info = iter_response_function_tool_info(tool)
@@ -284,37 +284,20 @@ def find_tool_properties(
         else:
             continue
         for name, params in tool_info:
-            if name != tool_name:
-                continue
-            parameter_schema = params or {}
-            composition_fields = ("anyOf", "oneOf", "allOf")
-            if not any(field in parameter_schema for field in composition_fields):
-                return parameter_schema.get("properties", {})
-            root_properties = parameter_schema.get("properties")
-            if not isinstance(root_properties, dict):
-                root_properties = {}
-            properties = dict(root_properties)
-            conflicting_keys: set[str] = set()
-            for field in composition_fields:
-                options = parameter_schema.get(field)
-                if not isinstance(options, list):
-                    continue
-                for option in options:
-                    if not isinstance(option, dict):
-                        continue
-                    option_properties = option.get("properties")
-                    if not isinstance(option_properties, dict):
-                        continue
-                    for key, value in option_properties.items():
-                        if key in root_properties or key in conflicting_keys:
-                            continue
-                        if key not in properties:
-                            properties[key] = value
-                            continue
-                        if properties[key] == value:
-                            continue
-                        properties.pop(key)
-                        conflicting_keys.add(key)
+            if name == tool_name:
+                return params or {}
+    return None
+
+
+def find_tool_properties(
+    tools: list[Tool] | None,
+    tool_name: str,
+) -> dict[str, Any]:
+    """Return a function tool's direct properties."""
+    schema = find_tool_schema(tools, tool_name)
+    if schema is not None:
+        properties = schema.get("properties")
+        if isinstance(properties, dict):
             return properties
     return {}
 
@@ -324,20 +307,7 @@ def find_tool_name(
     tool_name: str,
 ) -> bool:
     """Return whether a function tool with *tool_name* exists."""
-    if not tools:
-        return False
-    for tool in tools:
-        if isinstance(tool, (FunctionTool, NamespaceTool)):
-            for name, _ in iter_response_function_tool_info(tool):
-                if name == tool_name:
-                    return True
-            continue
-        if not _is_function_tool(tool):
-            continue
-        name, _ = _extract_tool_info(tool)
-        if name == tool_name:
-            return True
-    return False
+    return find_tool_schema(tools, tool_name) is not None
 
 
 def _get_tool_schema_from_name_and_params(
@@ -1054,22 +1024,25 @@ def extract_types_from_schema(schema: Any) -> list[str]:
                 if isinstance(t, str):
                     types.add(t)
 
-    if "enum" in schema and isinstance(schema["enum"], list) and schema["enum"]:
-        for value in schema["enum"]:
-            if value is None:
-                types.add("null")
-            elif isinstance(value, bool):
-                types.add("boolean")
-            elif isinstance(value, int):
-                types.add("integer")
-            elif isinstance(value, float):
-                types.add("number")
-            elif isinstance(value, str):
-                types.add("string")
-            elif isinstance(value, list):
-                types.add("array")
-            elif isinstance(value, dict):
-                types.add("object")
+    values = schema.get("enum")
+    values = values if isinstance(values, list) else []
+    if "const" in schema:
+        values = [schema["const"], *values]
+    for value in values:
+        if value is None:
+            types.add("null")
+        elif isinstance(value, bool):
+            types.add("boolean")
+        elif isinstance(value, int):
+            types.add("integer")
+        elif isinstance(value, float):
+            types.add("number")
+        elif isinstance(value, str):
+            types.add("string")
+        elif isinstance(value, list):
+            types.add("array")
+        elif isinstance(value, dict):
+            types.add("object")
 
     for choice_field in ("anyOf", "oneOf", "allOf"):
         if choice_field in schema and isinstance(schema[choice_field], list):

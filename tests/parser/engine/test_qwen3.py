@@ -858,6 +858,27 @@ class TestAnyOfTypeCoercion:
 
 class TestRootCompositionTypeCoercion:
     @pytest.fixture
+    def parser_for_schema(self, mock_tokenizer):
+        from vllm.entrypoints.openai.chat_completion.protocol import (
+            ChatCompletionToolsParam,
+        )
+
+        def create(schema):
+            tools = [
+                ChatCompletionToolsParam(
+                    type="function",
+                    function={"name": "configure", "parameters": schema},
+                )
+            ]
+            return ParserEngine(
+                mock_tokenizer,
+                tools=tools,
+                parser_engine_config=qwen3_config(thinking=False),
+            )
+
+        return create
+
+    @pytest.fixture
     def parser_with_composition(self, mock_tokenizer):
         from vllm.entrypoints.openai.chat_completion.protocol import (
             ChatCompletionToolsParam,
@@ -910,6 +931,17 @@ class TestRootCompositionTypeCoercion:
         args = json.loads(result.tool_calls[0].function.arguments)
         assert args == {"kind": "acme", "payload": {"value": "hello"}}
 
+    def test_other_branch_preserves_string(self, parser_with_composition, mock_request):
+        text = (
+            "<tool_call>\n<function=acme>\n"
+            "<parameter=kind>other</parameter>\n"
+            '<parameter=payload>{"value":"hello"}</parameter>\n'
+            "</function>\n</tool_call>"
+        )
+        result = parser_with_composition.extract_tool_calls(text, mock_request)
+        args = json.loads(result.tool_calls[0].function.arguments)
+        assert args == {"kind": "other", "payload": '{"value":"hello"}'}
+
     def test_streaming_object_param(self, parser_with_composition, mock_request):
         chunks = [
             "<tool_call>\n",
@@ -922,6 +954,244 @@ class TestRootCompositionTypeCoercion:
         results = simulate_tool_streaming(parser_with_composition, mock_request, chunks)
         args = json.loads(collect_tool_arguments(results))
         assert args == {"kind": "acme", "payload": {"value": "hello"}}
+
+    def test_streaming_object_before_discriminator(
+        self, parser_with_composition, mock_request
+    ):
+        chunks = [
+            "<tool_call>\n",
+            "<function=acme>\n",
+            '<parameter=payload>{"value":"hello"}</parameter>\n',
+            "<parameter=kind>acme</parameter>\n",
+            "</function>\n",
+            "</tool_call>",
+        ]
+        results = simulate_tool_streaming(parser_with_composition, mock_request, chunks)
+        args = json.loads(collect_tool_arguments(results))
+        assert args == {"payload": {"value": "hello"}, "kind": "acme"}
+
+    @pytest.mark.parametrize("reverse", (False, True))
+    def test_allof_refines_object(self, parser_for_schema, reverse):
+        branches = [
+            {"properties": {"payload": {"type": "object"}}},
+            {
+                "properties": {
+                    "payload": {
+                        "type": "object",
+                        "properties": {"count": {"type": "integer"}},
+                    }
+                }
+            },
+        ]
+        if reverse:
+            branches.reverse()
+        parser = parser_for_schema({"type": "object", "allOf": branches})
+        args = json.loads(
+            parser._fix_arg_types('{"payload":"{\\"count\\":\\"2\\"}"}', "configure")
+        )
+        assert args == {"payload": {"count": 2}}
+
+    def test_ambiguous_anyof_preserves_string(self, parser_for_schema):
+        schema = {
+            "type": "object",
+            "anyOf": [
+                {
+                    "properties": {"value": {"type": "integer"}},
+                    "required": ["value"],
+                },
+                {
+                    "properties": {"value": {"type": "string"}},
+                    "required": ["value"],
+                },
+            ],
+        }
+        parser = parser_for_schema(schema)
+        args = json.loads(parser._fix_arg_types('{"value":"42"}', "configure"))
+        assert args == {"value": "42"}
+
+    def test_equivalent_anyof_candidates_coerce(self, parser_for_schema):
+        schema = {
+            "type": "object",
+            "anyOf": [
+                {"properties": {"payload": {"type": "object"}}},
+                {"properties": {"payload": {"type": "object", "description": "input"}}},
+            ],
+        }
+        parser = parser_for_schema(schema)
+        args = json.loads(
+            parser._fix_arg_types(
+                '{"payload":"{\\"value\\":\\"hello\\"}"}', "configure"
+            )
+        )
+        assert args == {"payload": {"value": "hello"}}
+
+    def test_overlapping_oneof_preserves_string(self, parser_for_schema):
+        branch = {"properties": {"payload": {"type": "object"}}}
+        parser = parser_for_schema({"type": "object", "oneOf": [branch, branch]})
+        args = json.loads(
+            parser._fix_arg_types(
+                '{"payload":"{\\"value\\":\\"hello\\"}"}', "configure"
+            )
+        )
+        assert args == {"payload": '{"value":"hello"}'}
+
+    def test_incompatible_allof_preserves_string(self, parser_for_schema):
+        schema = {
+            "type": "object",
+            "allOf": [
+                {"properties": {"payload": {"type": "object"}}},
+                {"properties": {"payload": {"type": "string"}}},
+            ],
+        }
+        parser = parser_for_schema(schema)
+        args = json.loads(
+            parser._fix_arg_types(
+                '{"payload":"{\\"value\\":\\"hello\\"}"}', "configure"
+            )
+        )
+        assert args == {"payload": '{"value":"hello"}'}
+
+    def test_allof_and_oneof_are_both_applied(self, parser_for_schema):
+        schema = {
+            "type": "object",
+            "allOf": [
+                {
+                    "properties": {"count": {"type": "integer"}},
+                    "required": ["count"],
+                }
+            ],
+            "oneOf": [
+                {
+                    "properties": {
+                        "kind": {"const": "submit"},
+                        "payload": {"type": "object"},
+                    },
+                    "required": ["kind", "payload"],
+                },
+                {
+                    "properties": {"kind": {"const": "cancel"}},
+                    "required": ["kind"],
+                },
+            ],
+        }
+        parser = parser_for_schema(schema)
+        args = json.loads(
+            parser._fix_arg_types(
+                '{"kind":"submit","count":"2","payload":"{\\"value\\":\\"hello\\"}"}',
+                "configure",
+            )
+        )
+        assert args == {
+            "kind": "submit",
+            "count": 2,
+            "payload": {"value": "hello"},
+        }
+
+    def test_composed_array_recurses_into_items(self, parser_for_schema):
+        schema = {
+            "type": "object",
+            "oneOf": [
+                {
+                    "properties": {
+                        "kind": {"const": "batch"},
+                        "payload": {
+                            "type": "array",
+                            "items": {
+                                "type": "object",
+                                "properties": {"count": {"type": "integer"}},
+                            },
+                        },
+                    },
+                    "required": ["kind", "payload"],
+                },
+                {
+                    "properties": {"kind": {"const": "cancel"}},
+                    "required": ["kind"],
+                },
+            ],
+        }
+        parser = parser_for_schema(schema)
+        args = json.loads(
+            parser._fix_arg_types(
+                '{"kind":"batch","payload":"[{\\"count\\":\\"2\\"}]"}',
+                "configure",
+            )
+        )
+        assert args == {"kind": "batch", "payload": [{"count": 2}]}
+
+    def test_numeric_const_selects_branch(self, parser_for_schema):
+        schema = {
+            "type": "object",
+            "oneOf": [
+                {
+                    "properties": {
+                        "kind": {"const": 1},
+                        "payload": {"type": "object"},
+                    },
+                    "required": ["kind", "payload"],
+                },
+                {
+                    "properties": {"kind": {"const": 2}},
+                    "required": ["kind"],
+                },
+            ],
+        }
+        parser = parser_for_schema(schema)
+        args = json.loads(
+            parser._fix_arg_types(
+                '{"kind":"1","payload":"{\\"value\\":\\"hello\\"}"}',
+                "configure",
+            )
+        )
+        assert args == {"kind": 1, "payload": {"value": "hello"}}
+
+    def test_root_properties_apply_without_branch_match(self, parser_for_schema):
+        schema = {
+            "type": "object",
+            "properties": {"payload": {"type": "object"}},
+            "oneOf": [
+                {
+                    "properties": {"kind": {"const": "submit"}},
+                    "required": ["kind"],
+                },
+                {
+                    "properties": {"kind": {"const": "cancel"}},
+                    "required": ["kind"],
+                },
+            ],
+        }
+        parser = parser_for_schema(schema)
+        raw = json.dumps({"payload": json.dumps({"value": "hello"})})
+        args = json.loads(parser._fix_arg_types(raw, "configure"))
+        assert args == {"payload": {"value": "hello"}}
+
+    @pytest.mark.parametrize(
+        "schema",
+        (
+            {"type": "object", "oneOf": 5},
+            {
+                "type": "object",
+                "$defs": {
+                    "payload": {
+                        "properties": {"payload": {"type": "object"}},
+                    }
+                },
+                "oneOf": [{"$ref": "#/$defs/payload"}],
+            },
+            {
+                "type": "object",
+                "anyOf": [True, {"properties": {"payload": {"type": "object"}}}],
+            },
+        ),
+    )
+    def test_unresolved_composition_preserves_string(self, parser_for_schema, schema):
+        parser = parser_for_schema(schema)
+        args = json.loads(
+            parser._fix_arg_types(
+                '{"payload":"{\\"value\\":\\"hello\\"}"}', "configure"
+            )
+        )
+        assert args == {"payload": '{"value":"hello"}'}
 
 
 class TestSchemaCoercionBoolNumberNull:

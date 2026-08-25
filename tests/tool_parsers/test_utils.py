@@ -272,6 +272,9 @@ class TestExtractTypesFromSchema:
         result = set(extract_types_from_schema(schema))
         assert result == {"array", "object"}
 
+    def test_const_infers_type(self):
+        assert extract_types_from_schema({"const": 1}) == ["integer"]
+
     def test_none_schema_defaults_to_string(self):
         assert extract_types_from_schema(None) == ["string"]
 

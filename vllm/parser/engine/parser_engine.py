@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 from collections.abc import Sequence
+from copy import deepcopy
 from functools import cached_property
 from typing import TYPE_CHECKING
 
@@ -31,7 +32,7 @@ from vllm.tool_parsers.utils import (
     coerce_to_schema_type,
     extract_types_from_schema,
     find_tool_name,
-    find_tool_properties,
+    find_tool_schema,
 )
 
 if TYPE_CHECKING:
@@ -51,6 +52,7 @@ class ToolCallSlot:
         "name",
         "_args_parts",
         "_args_joined",
+        "defer_args",
         "name_sent",
         "string_keys",
         "streamed_json",
@@ -61,6 +63,7 @@ class ToolCallSlot:
         self.name: str = ""
         self._args_parts: list[str] = []
         self._args_joined: str | None = ""
+        self.defer_args: bool = False
         self.name_sent: bool = False
         self.string_keys: set[str] | None = None
         self.streamed_json: str = ""
@@ -234,6 +237,8 @@ class ParserEngine(Parser):
             types = extract_types_from_schema(schema)
             coerced = coerce_to_schema_type(value, types)
             if coerced is not value:
+                if isinstance(coerced, (dict, list)):
+                    coerced, _ = ParserEngine._coerce_value(coerced, schema)
                 return coerced, True
             return value, False
 
@@ -379,11 +384,63 @@ class ParserEngine(Parser):
         if not isinstance(args, dict):
             return args_json
 
-        properties = find_tool_properties(self._tools, func_name)
-        if not properties:
+        schema = find_tool_schema(self._tools, func_name)
+        if schema is None:
             return args_json
 
-        _, changed = self._coerce_dict(args, properties)
+        properties = schema.get("properties")
+        if not any(field in schema for field in ("oneOf", "anyOf", "allOf")):
+            if not isinstance(properties, dict):
+                return args_json
+            _, changed = self._coerce_dict(args, properties)
+        else:
+            original = args
+            fallback = deepcopy(args)
+            if isinstance(properties, dict):
+                self._coerce_dict(fallback, properties)
+            try:
+                from jsonschema.validators import validator_for
+
+                validator_cls = validator_for(schema)
+                validator_cls.check_schema(schema)
+                validator = validator_cls(schema)
+
+                candidate = deepcopy(fallback)
+
+                all_of = schema.get("allOf")
+                if isinstance(all_of, list):
+                    for option in all_of:
+                        if isinstance(option, dict):
+                            self._coerce_dict(candidate, option.get("properties", {}))
+
+                candidates = [candidate]
+                for field in ("oneOf", "anyOf"):
+                    options = schema.get(field)
+                    if not isinstance(options, list):
+                        continue
+                    resolved = []
+                    for candidate in candidates:
+                        for option in options:
+                            branch = deepcopy(candidate)
+                            if isinstance(option, dict):
+                                self._coerce_dict(branch, option.get("properties", {}))
+                            if (
+                                validator.evolve(schema=option).is_valid(branch)
+                                and branch not in resolved
+                            ):
+                                resolved.append(branch)
+                    candidates = resolved
+
+                candidates = [
+                    candidate
+                    for candidate in candidates
+                    if validator.is_valid(candidate)
+                ]
+                args = candidates[0] if len(candidates) == 1 else fallback
+            except Exception:
+                logger.debug("tool schema resolution failed", exc_info=True)
+                args = fallback
+            changed = args != original
 
         if changed:
             return json.dumps(args, ensure_ascii=False)
@@ -800,8 +857,13 @@ class ParserEngine(Parser):
         slot = self._tool_slots[idx]
         slot.name = name
         slot.name_sent = True
+        schema = find_tool_schema(self._tools, name) or {}
+        slot.defer_args = not self.parser_engine_config.tool_args_json and any(
+            field in schema for field in ("oneOf", "anyOf", "allOf")
+        )
+        properties = schema.get("properties")
         slot.string_keys = self._streamable_string_keys(
-            find_tool_properties(self._tools, name)
+            properties if isinstance(properties, dict) else {}
         )
         self._ensure_tool_id(slot, name)
         deltas.append(
@@ -858,8 +920,13 @@ class ParserEngine(Parser):
             if self._accept_tool_name(name):
                 slot.name = name
                 slot.name_sent = True
+                schema = find_tool_schema(self._tools, name) or {}
+                slot.defer_args = not self.parser_engine_config.tool_args_json and any(
+                    field in schema for field in ("oneOf", "anyOf", "allOf")
+                )
+                properties = schema.get("properties")
                 slot.string_keys = self._streamable_string_keys(
-                    find_tool_properties(self._tools, name)
+                    properties if isinstance(properties, dict) else {}
                 )
                 self._ensure_tool_id(slot, name)
                 deltas.append(
@@ -925,11 +992,14 @@ class ParserEngine(Parser):
         if not self._stream_arg_deltas:
             return None
 
+        slot = self._tool_slots[idx]
+        if slot.defer_args:
+            return None
+
         structural = self._arg_structural_chars
         if structural is not None and structural.isdisjoint(raw_delta):
             return None
 
-        slot = self._tool_slots[idx]
         try:
             current_json = converter(slot.args, True)
         except (json.JSONDecodeError, ValueError, TypeError):
